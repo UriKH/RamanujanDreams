@@ -1,4 +1,4 @@
-# Ramanujan Dreams
+# Ramanujan's Dreams
 
 ## Installation
 For installation as a package run: `pip install git+https://github.com/UriKH/RamanujanDreams.git`  
