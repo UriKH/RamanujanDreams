@@ -2,13 +2,13 @@
 Representation of a shard
 """
 import numpy as np
-import random
-
+import math
+from functools import reduce
 from rt_search.analysis_stage.shards.hyperplanes import Hyperplane
 from rt_search.analysis_stage.shards.searchable import *
 from rt_search.utils.caching import *
 import pulp
-from typing import Union, Set
+from typing import Union, Set, Iterator
 
 
 class Shard(Searchable):
@@ -68,61 +68,165 @@ class Shard(Searchable):
             Demands: gcd(coords) = 1, opt(within R radius), uniform sampling, dims 3-20
             Options: IHR (probably best). dim < 6 use Barvinok / LattE
         """
-        error = 1e-12
 
-        def neighbors(x, A, b, R=None, neighbor_radius=1):
-            # Return list of neighbor integer vectors of x given move set: coordinate +/-1
-            # Optionally restrict to points within Euclidean distance R from origin (or some ref).
-            d = len(x)
-            neighs = []
-            for j in range(d):
-                for s in (-1, +1):
-                    y = x.copy()
-                    y[j] += s
-                    if R is not None and np.linalg.norm(y) > R + error:
-                        continue
-                    if np.all(A @ y >= b):
-                        neighs.append(y)
-            return neighs
+        def vec_gcd(u: np.ndarray) -> int:
+            arr = np.abs(u.astype(int))
+            nz = arr[arr != 0]
+            if nz.size == 0:
+                return 0
+            return reduce(math.gcd, nz.tolist())
 
-        def integer_mh_sampler(A, b, x0, n_samples, burn=1000, thin=1, R=None):
+        def inside_cone(A: np.ndarray, u: np.ndarray) -> bool:
+            # return True if A @ u <= 0 (elementwise)
+            return np.all(A.dot(u) <= 0)
+
+        def compute_t_interval(A: np.ndarray, u: np.ndarray, d: np.ndarray, R: int) -> Optional[Tuple[int, int]]:
             """
-            Metropolis-Hastings sampler on integer lattice with target uniform over feasible integer points in intersection (bounded by R if given).
-            - A,b define Ax <= b constraints
-            - x0 initial feasible integer point (np.array int)
+            For inequalities A (u + t d) <= 0 find integer interval [t_min, t_max]
+            satisfying all row constraints and box ||u + t d||_inf <= R.
+            Return None if empty.
             """
-            d = A.shape[1]
-            x = x0.copy()
-            samples = []
-            total = burn + n_samples * thin
-            for step in range(total):
-                # propose neighbor by picking a coordinate and sign
-                j = random.randrange(d)
-                s = random.choice([-1, 1])
-                y = x.copy();
-                y[j] += s
-                if R is not None and np.linalg.norm(y) > R + 1e-12:
-                    accept = False
-                elif not self.in_space(y, A, b):
-                    accept = False
-                else:
-                    # compute degrees (number of feasible neighbors of each)
-                    deg_x = len(neighbors(x, A, b, R=R))
-                    deg_y = len(neighbors(y, A, b, R=R))
-                    if deg_y == 0:
-                        # shouldn't happen if y feasible, but guard
-                        accept = False
+            # Start with wide interval
+            tmin = -1e18
+            tmax = 1e18
+
+            # cone constraints A_i (u + t d) <= 0  => (A_i d) * t <= -A_i u
+            Au = A.dot(u)
+            Ad = A.dot(d)
+
+            for i in range(A.shape[0]):
+                ai_dot_d = Ad[i]
+                rhs = -Au[i]  # ai^T u + t*(ai^T d) <= 0 -> t*(ai^T d) <= -ai^T u
+
+                if ai_dot_d == 0:
+                    # requires rhs >= 0 (i.e. ai^T u <= 0), otherwise infeasible for any t
+                    if rhs < 0:
+                        return None
                     else:
-                        # Metropolis acceptance to target uniform: prob = min(1, deg_x / deg_y)
-                        alpha = min(1.0, deg_x / deg_y) if deg_y > 0 else 0.0
-                        accept = (random.random() < alpha)
-                if accept:
-                    x = y
-                if step >= burn and ((step - burn) % thin == 0):
-                    samples.append(x.copy())
-            return np.array(samples)
+                        continue
 
-        return None
+                # For ai_dot_d > 0: t <= floor(rhs / ai_dot_d)
+                if ai_dot_d > 0:
+                    tt = math.floor(rhs / ai_dot_d)
+                    if tt < tmax:
+                        tmax = tt
+                else:
+                    # ai_dot_d < 0: t >= ceil(rhs / ai_dot_d)
+                    tt = math.ceil(rhs / ai_dot_d)
+                    if tt > tmin:
+                        tmin = tt
+
+                if tmin > tmax:
+                    return None
+
+            # box constraints: for each coordinate j: -R <= u_j + t d_j <= R
+            for j in range(u.size):
+                dj = int(d[j])
+                uj = int(u[j])
+                if dj == 0:
+                    if abs(uj) > R:
+                        return None
+                    else:
+                        continue
+                # uj + t*dj <= R -> t <= floor((R - uj) / dj) if dj > 0, else t >= ceil((R - uj)/dj)
+                # uj + t*dj >= -R -> t >= ceil((-R - uj) / dj) if dj > 0, else t <= floor((-R - uj)/dj)
+                if dj > 0:
+                    tmax = min(tmax, math.floor((R - uj) / dj))
+                    tmin = max(tmin, math.ceil((-R - uj) / dj))
+                else:
+                    # dj < 0
+                    tmax = min(tmax, math.floor((-R - uj) / dj))
+                    tmin = max(tmin, math.ceil((R - uj) / dj))
+
+                if tmin > tmax:
+                    return None
+
+            # convert to ints
+            tmin = int(tmin)
+            tmax = int(tmax)
+            if tmin > tmax:
+                return None
+            return tmin, tmax
+
+        def random_integer_direction(n: int, max_coord: int) -> np.ndarray:
+            """
+            Produce a random integer direction d with coordinates in [-max_coord, max_coord],
+            and gcd(d) == 1 (so steps by t preserve lattice coverage).
+            Avoid d = 0 vector.
+            """
+            while True:
+                d = np.random.randint(-max_coord, max_coord + 1, size=n)
+                if np.all(d == 0):
+                    continue
+                if vec_gcd(d) != 1:
+                    # allow non-primitive directions too if you want, but primitive is safer for coverage
+                    # skip to ensure minimal step gcd = 1
+                    continue
+                return d.astype(int)
+
+        def integer_hit_and_run(
+                A: np.ndarray,
+                R: int,
+                u0: np.ndarray,
+                *,
+                max_coord_direction: Optional[int] = None,
+                tries_per_step: int = 20
+        ) -> Iterator[np.ndarray]:
+            """
+            Generator yielding successive integer lattice points u satisfying A u <= 0, ||u||_inf <= R
+            and gcd(u) == 1, using integer hit-and-run steps.
+            - A: m x n numpy array
+            - R: bounding box radius (infinity norm)
+            - u0: initial feasible primitive vector (numpy int array)
+            - max_coord_direction: max absolute coordinate for random direction sampling (default ~R or 2)
+            - tries_per_step: how many directions to try before yielding the same point (avoid infinite loops)
+            """
+            n = A.shape[1]
+            if max_coord_direction is None:
+                max_coord_direction = max(1, min(2 * R, 5))
+
+            u = u0.copy().astype(int)
+            if not inside_cone(A, u) or vec_gcd(u) != 1 or np.max(np.abs(u)) > R:
+                raise ValueError("u0 is not a feasible primitive point within box.")
+
+            while True:
+                moved = False
+                for attempt in range(tries_per_step):
+                    d = random_integer_direction(n, max_coord_direction)
+                    interval = compute_t_interval(A, u, d, R)
+                    if interval is None:
+                        continue
+                    tmin, tmax = interval
+                    # note: could be large; sample uniform integer in [tmin, tmax]
+                    if tmin > tmax:
+                        continue
+                    # if interval is tiny (single point t=0), maybe skip
+                    # sample t uniformly:
+                    t = np.random.randint(tmin, tmax + 1)
+                    u_new = u + int(t) * d
+                    # optional: enforce primitive
+                    if vec_gcd(u_new) != 1:
+                        # try to find any t in interval giving gcd=1 before giving up
+                        # naive attempt: sample a few times, otherwise continue attempts
+                        found = False
+                        for _ in range(6):
+                            t = np.random.randint(tmin, tmax + 1)
+                            u_try = u + int(t) * d
+                            if vec_gcd(u_try) == 1:
+                                u_new = u_try
+                                found = True
+                                break
+                        if not found:
+                            continue
+                    # accept (uniform in the allowed t-interval)
+                    u = u_new
+                    moved = True
+                    break
+
+                # yield current state (moved or not). Caller can decide whether to treat stationary steps as samples.
+                yield u.copy()
+
+                # if we failed to move after tries_per_step attempts, we still yield the current u (chain can stay put)
 
     # TODO: remove this if not used...
     # from scipy.optimize import linprog
