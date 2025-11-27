@@ -18,6 +18,6 @@ class Searchable(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def sample_trajectory(self, n_samples=Optional[int]) -> List[Position]:
+    def sample_trajectories(self, n_samples: int) -> List[Position]:
         raise NotImplementedError()
 
